@@ -9,7 +9,9 @@ import java.util.stream.Stream;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.tomakehurst.wiremock.WireMockServer;
+import com.github.tomakehurst.wiremock.http.Fault;
 import com.github.tomakehurst.wiremock.http.RequestMethod;
+import com.github.tomakehurst.wiremock.stubbing.Scenario;
 import com.github.tomakehurst.wiremock.verification.LoggedRequest;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.table.api.bridge.java.StreamTableEnvironment;
@@ -337,5 +339,49 @@ public class BatchRequestHttpDynamicSinkInsertTest {
             request.getBodyAsString()
         );
 
+    }
+
+    @Test
+    void shouldRetryOnFailureAndSucceedOnSecondAttempt() throws Exception {
+        // GIVEN
+        wireMockServer.stubFor(
+            post(urlEqualTo("/myendpoint"))
+                .withHeader("Content-Type", equalTo("application/json"))
+                .inScenario("Retry Scenario")
+                .whenScenarioStateIs(Scenario.STARTED) // Initial state
+                .willReturn(aResponse()
+                    .withFault(Fault.CONNECTION_RESET_BY_PEER)) // Fail the first request
+                .willSetStateTo("Cause Success")); // Set the next state
+
+        wireMockServer.stubFor(
+            post(urlEqualTo("/myendpoint"))
+                .withHeader("Content-Type", equalTo("application/json"))
+                .inScenario("Retry Scenario")
+                .whenScenarioStateIs("Cause Success") // When the state is "Cause Success"
+                .willReturn(aResponse()
+                    .withStatus(200)
+                    .withBody("Success")));
+
+        final String createTable =
+            String.format(
+                "CREATE TABLE http (\n"
+                    + "  last_name string"
+                    + ") with (\n"
+                    + "  'connector' = '%s',\n"
+                    + "  'url' = '%s',\n"
+                    + "  'format' = 'json',\n"
+                    + "  'gid.connector.http.sink.header.Content-Type' = 'application/json'\n"
+                    + ")",
+                HttpDynamicTableSinkFactory.IDENTIFIER,
+                "http://localhost:" + SERVER_PORT + "/myendpoint"
+            );
+
+        tEnv.executeSql(createTable);
+
+        final String insert = "INSERT INTO http VALUES ('Clee'), ('John')";
+        tEnv.executeSql(insert).await();
+
+        // THEN
+        wireMockServer.verify(2, postRequestedFor(urlEqualTo("/myendpoint")));
     }
 }

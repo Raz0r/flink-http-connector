@@ -4,9 +4,11 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
 import java.util.Properties;
-import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
+import java.util.stream.Collectors;
 
 import lombok.extern.slf4j.Slf4j;
 import org.apache.flink.api.connector.sink2.Sink;
@@ -18,6 +20,7 @@ import org.apache.flink.util.concurrent.ExecutorThreadFactory;
 
 import com.getindata.connectors.http.internal.SinkHttpClient;
 import com.getindata.connectors.http.internal.config.HttpConnectorConfigConstants;
+import com.getindata.connectors.http.internal.sink.httpclient.HttpRequest;
 import com.getindata.connectors.http.internal.utils.ThreadUtils;
 
 /**
@@ -37,13 +40,16 @@ public class HttpSinkWriter<InputT> extends AsyncSinkWriter<InputT, HttpSinkRequ
     /**
      * Thread pool to handle HTTP response from HTTP client.
      */
-    private final ExecutorService sinkWriterThreadPool;
+    private final ScheduledExecutorService sinkWriterThreadPool;
 
     private final String endpointUrl;
 
     private final SinkHttpClient sinkHttpClient;
 
     private final Counter numRecordsSendErrorsCounter;
+
+    private static final int MAX_RETRIES = 3;
+    private static final long INITIAL_BACKOFF_MS = 1000;
 
     public HttpSinkWriter(
             ElementConverter<InputT, HttpSinkRequestEntry> elementConverter,
@@ -73,49 +79,65 @@ public class HttpSinkWriter<InputT> extends AsyncSinkWriter<InputT, HttpSinkRequ
         ));
 
         this.sinkWriterThreadPool =
-            Executors.newFixedThreadPool(
+            Executors.newScheduledThreadPool(
                 sinkWriterThreadPollSize,
                 new ExecutorThreadFactory(
                     "http-sink-writer-worker", ThreadUtils.LOGGING_EXCEPTION_HANDLER));
     }
 
-    // TODO: Reintroduce retries by adding backoff policy
     @Override
     protected void submitRequestEntries(
             List<HttpSinkRequestEntry> requestEntries,
             Consumer<List<HttpSinkRequestEntry>> requestResult) {
+        submitWithRetries(requestEntries, requestResult, 0, INITIAL_BACKOFF_MS);
+    }
+
+    private void submitWithRetries(
+            List<HttpSinkRequestEntry> requestEntries,
+            Consumer<List<HttpSinkRequestEntry>> requestResult,
+            int attempt,
+            long backoff) {
+
         var future = sinkHttpClient.putRequests(requestEntries, endpointUrl);
         future.whenCompleteAsync((response, err) -> {
-            if (err != null) {
-                int failedRequestsNumber = requestEntries.size();
-                log.error(
-                    "Http Sink fatally failed to write all {} requests",
-                    failedRequestsNumber);
+            if (err != null || !response.getFailedRequests().isEmpty()) {
+                int failedRequestsNumber = err != null ? requestEntries.size()
+                                                   : response.getFailedRequests().size();
+                log.error("Http Sink failed to write {} requests", failedRequestsNumber);
                 numRecordsSendErrorsCounter.inc(failedRequestsNumber);
 
-                // TODO: Make `HttpSinkInternal` retry the failed requests.
-                //  Currently, it does not retry those at all, only adds their count
-                //  to the `numRecordsSendErrors` metric. It is due to the fact we do not have
-                //  a clear image how we want to do it, so it would be both efficient and correct.
-                //requestResult.accept(requestEntries);
-            } else if (response.getFailedRequests().size() > 0) {
-                int failedRequestsNumber = response.getFailedRequests().size();
-                log.error("Http Sink failed to write and will retry {} requests",
-                    failedRequestsNumber);
-                numRecordsSendErrorsCounter.inc(failedRequestsNumber);
+                if (attempt < MAX_RETRIES) {
+                    long nextBackoff = backoff * 2;
+                    log.info("Retrying {} requests after {} ms (attempt {}/{})",
+                             failedRequestsNumber, backoff, attempt + 1, MAX_RETRIES);
 
-                // TODO: Make `HttpSinkInternal` retry the failed requests. Currently,
-                //  it does not retry those at all, only adds their count to the
-                //  `numRecordsSendErrors` metric. It is due to the fact we do not have
-                //  a clear image how we want to do it, so it would be both efficient and correct.
+                    List<HttpSinkRequestEntry> failedRequestEntries = err != null
+                            ? requestEntries
+                            : convertToHttpSinkRequestEntries(response.getFailedRequests());
 
-                //requestResult.accept(response.getFailedRequests());
-                //} else {
-                //requestResult.accept(Collections.emptyList());
-                //}
+                    sinkWriterThreadPool.schedule(
+                        () -> submitWithRetries(failedRequestEntries, requestResult,
+                            attempt + 1, nextBackoff),
+                        backoff, TimeUnit.MILLISECONDS);
+                } else {
+                    log.error("Http Sink failed to write requests after {} attempts", MAX_RETRIES);
+                    requestResult.accept(err != null
+                            ? requestEntries
+                            : convertToHttpSinkRequestEntries(response.getFailedRequests()));
+                }
+            } else {
+                requestResult.accept(Collections.emptyList());
             }
-            requestResult.accept(Collections.emptyList());
         }, sinkWriterThreadPool);
+    }
+
+    private List<HttpSinkRequestEntry> convertToHttpSinkRequestEntries(
+            List<HttpRequest> httpRequests) {
+        return httpRequests.stream()
+                       .flatMap(request -> request.getElements().stream()
+                               .map(element -> new HttpSinkRequestEntry(request.getMethod(),
+                                    element)))
+                       .collect(Collectors.toList());
     }
 
     @Override
